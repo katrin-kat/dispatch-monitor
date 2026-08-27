@@ -40,10 +40,14 @@ app = Flask(__name__)
 
 
 def safe_get_json(request_obj):
-    """Надёжно разбирает тело запроса в JSON. Если это не JSON (например,
-    тестовый пинг от сервиса при подключении вебхука) — просто возвращает
-    пустой словарь вместо падения с ошибкой 500."""
+    """Надёжно разбирает тело запроса. CallRail присылает данные в формате
+    form-data (например: answered=false&callercity=...), а не JSON — поэтому
+    сначала проверяем form-data, и только если её нет, пробуем JSON.
+    Если это тестовый пинг ({"foo":"bar"} или пусто) — просто вернёт то,
+    что есть, без падения с ошибкой."""
     try:
+        if request_obj.form:
+            return request_obj.form.to_dict()
         raw = request_obj.get_data(as_text=True) or ""
         if not raw.strip():
             return {}
@@ -126,51 +130,102 @@ def verify_callrail_signature(request_obj):
 
 
 # ---------- Роут 1: вебхук звонков от CallRail ----------
+def _extract_call_fields(data):
+    """CallRail присылает данные в формате form-data. Реальные названия полей
+    (проверено по логам): answered, callername, callernum, customer_phone_number,
+    destinationnum, duration, datetime, employee_email / agent_email — могут
+    отличаться в зависимости от настроек аккаунта, поэтому пробуем несколько
+    вариантов названий."""
+    answered_raw = str(data.get("answered", "false")).strip().lower()
+    answered = answered_raw in ("true", "1", "yes")
+
+    customer_name = data.get("callername") or data.get("customer_name", "")
+    customer_phone = (
+        data.get("customer_phone_number")
+        or data.get("callernum")
+        or data.get("caller_id", "")
+    )
+    agent_email = (
+        data.get("agent_email")
+        or data.get("employee_email")
+        or data.get("answered_by_email", "")
+    )
+    duration = data.get("duration", 0) or 0
+    voicemail = str(data.get("voicemail", "false")).lower() in ("true", "1", "yes")
+    call_id = data.get("id") or data.get("call_id", "")
+    start_time = data.get("datetime") or data.get("start_time") or datetime.datetime.utcnow().isoformat()
+
+    return {
+        "call_id": call_id, "answered": answered, "customer_name": customer_name,
+        "customer_phone": customer_phone, "agent_email": agent_email,
+        "duration": duration, "voicemail": voicemail, "start_time": start_time,
+    }
+
+
+# ---------- Роут 1а: вебхук ВХОДЯЩИХ звонков от CallRail (Post-Call) ----------
 @app.route("/webhook/callrail/call", methods=["POST"])
 def callrail_call_webhook():
     if not verify_callrail_signature(request):
         return jsonify({"error": "неверная подпись"}), 403
 
     data = safe_get_json(request)
-
-    call_id = data.get("id")                                   # СВЕРИТЬ
-    answered = data.get("answered", False)                     # СВЕРИТЬ
-    direction = data.get("direction", "inbound")                # СВЕРИТЬ
-    customer_name = data.get("customer_name", "")                # СВЕРИТЬ
-    customer_phone = data.get("customer_phone_number", "")       # СВЕРИТЬ
-    agent_email = data.get("agent_email", "")                    # СВЕРИТЬ
-    duration = data.get("duration", 0) or 0
-    voicemail = data.get("voicemail", False)
-    start_time = data.get("start_time", datetime.datetime.utcnow().isoformat())
+    f = _extract_call_fields(data)
+    if not f["call_id"] and not f["customer_phone"]:
+        return jsonify({"status": "ok", "note": "тестовый запрос принят"}), 200
 
     sh = get_sheet()
     ensure_worksheets(sh)
     ws = sh.worksheet("Calls")
 
-    if not answered:
-        dispatcher_name = DISPATCHER_NAMES.get(agent_email, agent_email or "неизвестно")
+    if not f["answered"]:
+        dispatcher_name = DISPATCHER_NAMES.get(f["agent_email"], f["agent_email"] or "unknown")
         text = (
-            f"⚠️ Пропущенный звонок\n"
-            f"От: {customer_name or customer_phone}\n"
-            f"Телефон: {customer_phone}\n"
-            f"Время: {start_time}\n"
-            f"Диспетчер должен перезвонить и дозвониться. "
-            f"Если не дозвонится — напомню снова через {MISSED_CALL_ALERT_MINUTES} мин."
+            f"⚠️ Missed call\n"
+            f"From: {f['customer_name'] or f['customer_phone']}\n"
+            f"Phone: {f['customer_phone']}\n"
+            f"Time: {f['start_time']}\n"
+            f"The dispatcher needs to call back and reach the customer. "
+            f"If not reached, I'll remind again in {MISSED_CALL_ALERT_MINUTES} min."
         )
         send_telegram(OWNER_CHAT_ID, text)
         ws.append_row([
-            call_id, start_time, direction, customer_name, customer_phone,
-            agent_email, str(answered), duration, str(voicemail),
+            f["call_id"], f["start_time"], "inbound", f["customer_name"], f["customer_phone"],
+            f["agent_email"], str(f["answered"]), f["duration"], str(f["voicemail"]),
             "False", datetime.datetime.utcnow().isoformat()
         ])
     else:
-        # Это отвеченный звонок. Если это перезвон клиенту, у которого раньше
-        # был пропущенный звонок — закрываем тот пропущенный как "решённый".
-        _resolve_missed_call(ws, customer_phone, start_time)
         ws.append_row([
-            call_id, start_time, direction, customer_name, customer_phone,
-            agent_email, str(answered), duration, str(voicemail), "True", ""
+            f["call_id"], f["start_time"], "inbound", f["customer_name"], f["customer_phone"],
+            f["agent_email"], str(f["answered"]), f["duration"], str(f["voicemail"]), "True", ""
         ])
+
+    return jsonify({"status": "ok"}), 200
+
+
+# ---------- Роут 1б: вебхук ИСХОДЯЩИХ звонков от CallRail (Outbound Post-Call) ----------
+# Отдельный адрес — чтобы точно знать, что это перезвон, а не новый звонок клиента
+@app.route("/webhook/callrail/call/outbound", methods=["POST"])
+def callrail_outbound_call_webhook():
+    if not verify_callrail_signature(request):
+        return jsonify({"error": "неверная подпись"}), 403
+
+    data = safe_get_json(request)
+    f = _extract_call_fields(data)
+    if not f["call_id"] and not f["customer_phone"]:
+        return jsonify({"status": "ok", "note": "тестовый запрос принят"}), 200
+
+    sh = get_sheet()
+    ensure_worksheets(sh)
+    ws = sh.worksheet("Calls")
+
+    # Если дозвонились клиенту, у которого был пропущенный звонок — закрываем его
+    if f["answered"]:
+        _resolve_missed_call(ws, f["customer_phone"], f["start_time"])
+
+    ws.append_row([
+        f["call_id"], f["start_time"], "outbound", f["customer_name"], f["customer_phone"],
+        f["agent_email"], str(f["answered"]), f["duration"], str(f["voicemail"]), "True", ""
+    ])
 
     return jsonify({"status": "ok"}), 200
 
@@ -190,40 +245,57 @@ def _resolve_missed_call(calls_ws, customer_phone, new_call_timestamp):
             calls_ws.update_cell(idx, 10, "True")  # колонка resolved
 
 
-# ---------- Роут 2: вебхук SMS от CallRail ----------
-@app.route("/webhook/callrail/sms", methods=["POST"])
-def callrail_sms_webhook():
+# ---------- Роут 2а: SMS ПОЛУЧЕНО от клиента (Text Message Received) ----------
+@app.route("/webhook/callrail/sms/received", methods=["POST"])
+def callrail_sms_received_webhook():
     if not verify_callrail_signature(request):
         return jsonify({"error": "неверная подпись"}), 403
 
     data = safe_get_json(request)
+    message_id = data.get("id") or data.get("message_id", "")
+    from_number = data.get("customer_phone_number") or data.get("callernum", "")
+    to_number = data.get("tracking_phone_number") or data.get("destinationnum", "")
+    agent_email = data.get("agent_email") or data.get("employee_email", "")
+    timestamp = data.get("created_at") or data.get("datetime") or datetime.datetime.utcnow().isoformat()
 
-    message_id = data.get("id")                       # СВЕРИТЬ
-    direction = data.get("direction", "inbound")        # СВЕРИТЬ
-    from_number = data.get("customer_phone_number", "")  # СВЕРИТЬ
-    to_number = data.get("tracking_phone_number", "")    # СВЕРИТЬ
-    agent_email = data.get("agent_email", "")
-    timestamp = data.get("created_at", datetime.datetime.utcnow().isoformat())  # СВЕРИТЬ
+    if not from_number:
+        return jsonify({"status": "ok", "note": "тестовый запрос принят"}), 200
 
     sh = get_sheet()
     ensure_worksheets(sh)
     ws = sh.worksheet("Messages")
+    ws.append_row([
+        message_id, timestamp, "inbound", from_number, to_number,
+        agent_email, "False", "False", datetime.datetime.utcnow().isoformat()
+    ])
+    return jsonify({"status": "ok"}), 200
 
-    if direction == "inbound":
-        # Входящее сообщение от клиента — пока без ответа
-        ws.append_row([
-            message_id, timestamp, direction, from_number, to_number,
-            agent_email, "False", "False", datetime.datetime.utcnow().isoformat()
-        ])
-    else:
-        # Исходящее сообщение — это и есть ответ диспетчера клиенту.
-        # Находим более раннее нерешённое сообщение от этого же номера и закрываем его.
-        _resolve_pending_sms(ws, to_number)
-        ws.append_row([
-            message_id, timestamp, direction, from_number, to_number,
-            agent_email, "True", "True", ""
-        ])
 
+# ---------- Роут 2б: SMS ОТПРАВЛЕНО диспетчером (Text Message Sent) ----------
+@app.route("/webhook/callrail/sms/sent", methods=["POST"])
+def callrail_sms_sent_webhook():
+    if not verify_callrail_signature(request):
+        return jsonify({"error": "неверная подпись"}), 403
+
+    data = safe_get_json(request)
+    message_id = data.get("id") or data.get("message_id", "")
+    from_number = data.get("tracking_phone_number") or data.get("destinationnum", "")
+    to_number = data.get("customer_phone_number") or data.get("callernum", "")
+    agent_email = data.get("agent_email") or data.get("employee_email", "")
+    timestamp = data.get("created_at") or data.get("datetime") or datetime.datetime.utcnow().isoformat()
+
+    if not to_number:
+        return jsonify({"status": "ok", "note": "тестовый запрос принят"}), 200
+
+    sh = get_sheet()
+    ensure_worksheets(sh)
+    ws = sh.worksheet("Messages")
+    # Это ответ диспетчера клиенту — закрываем висящее входящее SMS от этого номера
+    _resolve_pending_sms(ws, to_number)
+    ws.append_row([
+        message_id, timestamp, "outbound", from_number, to_number,
+        agent_email, "True", "True", ""
+    ])
     return jsonify({"status": "ok"}), 200
 
 
@@ -276,7 +348,7 @@ def housecallpro_appointment_webhook():
         first = assigned[0]
         dispatcher_raw = first.get("email", first.get("first_name", "")) if isinstance(first, dict) else str(first)
 
-    dispatcher_name = DISPATCHER_NAMES.get(dispatcher_raw, dispatcher_raw or "не указан")
+    dispatcher_name = DISPATCHER_NAMES.get(dispatcher_raw, dispatcher_raw or "unassigned")
 
     sh = get_sheet()
     ensure_worksheets(sh)
@@ -306,16 +378,18 @@ def performance_report():
 
     if period == "week":
         cutoff = now - datetime.timedelta(days=7)
-        label = "за последние 7 дней"
+        label = "for the last 7 days"
     else:
         cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        label = "за сегодня"
+        label = "for today"
 
     def in_period(ts_str):
         try:
             ts = datetime.datetime.fromisoformat(str(ts_str).replace("Z", ""))
         except (ValueError, TypeError):
             return False
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
         return ts >= cutoff
 
     calls = [c for c in sh.worksheet("Calls").get_all_records() if in_period(c["timestamp"])]
@@ -333,7 +407,7 @@ def performance_report():
         return agents[name]
 
     for c in calls:
-        name = DISPATCHER_NAMES.get(c["agent_email"], c["agent_email"] or "не назначен")
+        name = DISPATCHER_NAMES.get(c["agent_email"], c["agent_email"] or "unassigned")
         a = get_agent(name)
         a["calls_total"] += 1
         if str(c["answered"]) == "True":
@@ -342,7 +416,7 @@ def performance_report():
 
     for m in messages:
         # считаем только исходящие (ответы диспетчера) как "активность"
-        name = DISPATCHER_NAMES.get(m["agent_email"], m["agent_email"] or "не назначен")
+        name = DISPATCHER_NAMES.get(m["agent_email"], m["agent_email"] or "unassigned")
         a = get_agent(name)
         if m["direction"] == "inbound":
             a["sms_total"] += 1
@@ -351,7 +425,7 @@ def performance_report():
         _update_last_activity(a, m["timestamp"])
 
     for ap in appointments:
-        name = ap["dispatcher"] or "не указан"
+        name = ap["dispatcher"] or "unassigned"
         a = get_agent(name)
         a["appointments"] += 1
         _update_last_activity(a, ap["timestamp_created"])
@@ -363,33 +437,32 @@ def performance_report():
         answer_rate = round(100 * a["calls_answered"] / a["calls_total"]) if a["calls_total"] else None
         sms_rate = round(100 * a["sms_answered"] / a["sms_total"]) if a["sms_total"] else None
         idle_hours = None
-        status = "нет данных"
+        status = "no data"
         if a["last_activity"]:
             idle_hours = round((now - a["last_activity"]).total_seconds() / 3600, 1)
             if is_workday_now and idle_hours >= NO_ACTIVITY_ALERT_HOURS:
-                status = f"⚠️ нет активности {idle_hours} ч."
+                status = f"⚠️ no activity for {idle_hours} h."
             else:
-                status = "на месте"
+                status = "active"
         rows.append({
             "name": name, "answer_rate": answer_rate, "sms_rate": sms_rate,
             "calls_total": a["calls_total"], "sms_total": a["sms_total"],
             "appointments": a["appointments"], "idle_hours": idle_hours, "status": status,
         })
 
-    # Сортируем по проценту отвеченных звонков — от худшего к лучшему,
-    # чтобы проблемные сразу были видны сверху
+    # Sort by answer rate — worst to best, so problem dispatchers show up first
     rows.sort(key=lambda r: (r["answer_rate"] is None, r["answer_rate"]))
 
-    lines = [f"📈 Сравнение диспетчеров {label}\n"]
+    lines = [f"📈 Dispatcher comparison {label}\n"]
     for r in rows:
         ar = f"{r['answer_rate']}%" if r["answer_rate"] is not None else "—"
         sr = f"{r['sms_rate']}%" if r["sms_rate"] is not None else "—"
         lines.append(
-            f"— {r['name']}: звонки {ar} ({r['calls_total']}), "
-            f"SMS {sr} ({r['sms_total']}), встреч {r['appointments']} — {r['status']}"
+            f"— {r['name']}: calls {ar} ({r['calls_total']}), "
+            f"SMS {sr} ({r['sms_total']}), appointments {r['appointments']} — {r['status']}"
         )
     if not rows:
-        lines.append("Данных пока нет.")
+        lines.append("No data yet.")
 
     send_telegram(OWNER_CHAT_ID, "\n".join(lines))
     return jsonify({"status": "ok", "report": rows}), 200
@@ -400,6 +473,8 @@ def _update_last_activity(agent_dict, ts_str):
         ts = datetime.datetime.fromisoformat(str(ts_str).replace("Z", ""))
     except (ValueError, TypeError):
         return
+    if ts.tzinfo is not None:
+        ts = ts.replace(tzinfo=None)
     if agent_dict["last_activity"] is None or ts > agent_dict["last_activity"]:
         agent_dict["last_activity"] = ts
 
@@ -418,6 +493,8 @@ def check_pending():
             ts = datetime.datetime.fromisoformat(str(ts_str).replace("Z", ""))
         except (ValueError, TypeError):
             return None
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
         return (now - ts).total_seconds() / 60
 
     # --- Пропущенные звонки, на которые ещё не перезвонили ---
@@ -427,10 +504,10 @@ def check_pending():
             since_alert = minutes_since(row["last_alert_time"])
             if since_alert is not None and since_alert >= MISSED_CALL_ALERT_MINUTES:
                 text = (
-                    f"🔁 Всё ещё не дозвонились клиенту\n"
-                    f"Телефон: {row['customer_phone']}\n"
-                    f"Пропущенный звонок был: {row['timestamp']}\n"
-                    f"Прошло без результата: {int(since_alert)} мин."
+                    f"🔁 Customer still not reached\n"
+                    f"Phone: {row['customer_phone']}\n"
+                    f"Missed call was at: {row['timestamp']}\n"
+                    f"Time without resolution: {int(since_alert)} min."
                 )
                 send_telegram(OWNER_CHAT_ID, text)
                 calls_ws.update_cell(idx, 11, now.isoformat())  # last_alert_time
@@ -443,10 +520,10 @@ def check_pending():
             since_alert = minutes_since(row["last_alert_time"])
             if since_alert is not None and since_alert >= SMS_NO_RESPONSE_ALERT_MINUTES:
                 text = (
-                    f"🔁 Всё ещё нет ответа клиенту на SMS\n"
-                    f"От: {row['from']}\n"
-                    f"Сообщение пришло: {row['timestamp']}\n"
-                    f"Прошло без ответа: {int(since_alert)} мин."
+                    f"🔁 Customer SMS still unanswered\n"
+                    f"From: {row['from']}\n"
+                    f"Message received: {row['timestamp']}\n"
+                    f"Time without reply: {int(since_alert)} min."
                 )
                 send_telegram(OWNER_CHAT_ID, text)
                 messages_ws.update_cell(idx, 9, now.isoformat())  # last_alert_time
@@ -473,7 +550,7 @@ def daily_summary():
 
     stats = {}
     for c in today_calls:
-        agent = DISPATCHER_NAMES.get(c["agent_email"], c["agent_email"] or "не назначен")
+        agent = DISPATCHER_NAMES.get(c["agent_email"], c["agent_email"] or "unassigned")
         stats.setdefault(agent, {"answered": 0, "missed": 0, "sms_answered": 0, "sms_missed": 0, "appointments": 0})
         if str(c["answered"]) == "True":
             stats[agent]["answered"] += 1
@@ -481,7 +558,7 @@ def daily_summary():
             stats[agent]["missed"] += 1
 
     for m in today_messages:
-        agent = DISPATCHER_NAMES.get(m["agent_email"], m["agent_email"] or "не назначен")
+        agent = DISPATCHER_NAMES.get(m["agent_email"], m["agent_email"] or "unassigned")
         stats.setdefault(agent, {"answered": 0, "missed": 0, "sms_answered": 0, "sms_missed": 0, "appointments": 0})
         if str(m["responded"]) == "True":
             stats[agent]["sms_answered"] += 1
@@ -489,19 +566,19 @@ def daily_summary():
             stats[agent]["sms_missed"] += 1
 
     for a in today_appointments:
-        agent = a["dispatcher"] or "не указан"
+        agent = a["dispatcher"] or "unassigned"
         stats.setdefault(agent, {"answered": 0, "missed": 0, "sms_answered": 0, "sms_missed": 0, "appointments": 0})
         stats[agent]["appointments"] += 1
 
-    lines = [f"📊 Сводка за {today}\n"]
+    lines = [f"📊 Summary for {today}\n"]
     for agent, s in stats.items():
         lines.append(
-            f"— {agent}: звонков принято {s['answered']}, пропущено {s['missed']}, "
-            f"SMS отвечено {s['sms_answered']}, без ответа {s['sms_missed']}, "
-            f"встреч назначено {s['appointments']}"
+            f"— {agent}: calls answered {s['answered']}, missed {s['missed']}, "
+            f"SMS answered {s['sms_answered']}, unanswered {s['sms_missed']}, "
+            f"appointments booked {s['appointments']}"
         )
     if not stats:
-        lines.append("Сегодня данных пока нет.")
+        lines.append("No data yet today.")
 
     send_telegram(OWNER_CHAT_ID, "\n".join(lines))
     return jsonify({"status": "ok", "stats": stats}), 200
